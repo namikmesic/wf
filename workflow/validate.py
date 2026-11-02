@@ -10,7 +10,8 @@ The checks run in this order, because later ones lean on earlier ones:
 2. schemas: `types`, start.input, node outputs, end output schemas
 3. sub-workflows: each is checked too (its problems are reported with its
    own file name), and its end output becomes the parent node's output schema
-4. per node: templates and expressions, for_each, harness, tools, workspace, `with`
+4. per node: templates and expressions, for_each, harness, tools, `commit_message`,
+   workspace, `with`
 5. `branch` names, end outputs, then the warnings that need the whole graph
 
 Templates are checked without running them. templates.references() lists every
@@ -356,6 +357,8 @@ class _Checker:
         fields: list[tuple[str, str]] = []
         if node.kind == "agent":
             fields.append(("instruction", node.instruction))
+            if node.commit_message is not None:
+                fields.append(("commit_message", node.commit_message))
         elif node.kind == "command":
             fields += [("command", node.command)] + [(f"env.{k}", v) for k, v in self.wf.setting(node_id, "env").items()]
         elif node.kind == "human":
@@ -367,6 +370,8 @@ class _Checker:
         if node.branch is not None:
             fields.append(("branch", node.branch))
         for name, source in fields:
+            if name == "commit_message":
+                self._commit_message(f"{at}.commit_message", source, node_id)
             refs = self._template(f"{at}.{name}", source, node_id, "node")
             if refs and name == "command":
                 self._unquoted(f"{at}.command", refs, node_id)
@@ -376,6 +381,8 @@ class _Checker:
             possible = self._harness(node_id)
             self._tools(node_id, possible)
             self._project_instructions(node_id, possible)
+            if node.commit_message is not None:
+                self._commits(node_id)
         if node.kind == "workflow":
             self._with(node_id)
         for i, route in enumerate(node.routes):
@@ -590,8 +597,9 @@ class _Checker:
             self.warn(where, f"puts output from {listed} into the shell unquoted; pass it through `env` and use \"$NAME\", or add `| quote`")
 
     def _web_to_full(self, where: str, refs: list[Ref], node_id: str) -> None:
-        """An agent with `access: full` that reads what an agent with web pages or wf tools wrote."""
-        if self.wf.setting(node_id, "access") != "full":
+        """An agent with `access: full` or `review` that reads what an agent with web pages or wf tools wrote."""
+        access = self.wf.setting(node_id, "access")
+        if access not in ("full", "review"):
             return
         sources = []
         for ref in refs:
@@ -601,10 +609,10 @@ class _Checker:
                 sources.append(target)
         for source in dict.fromkeys(sources):
             if self.wf.setting(source, "web"):
-                self.warn(where, f"an agent with `access: full` reads output from `{source}`, which has `web: true`; "
+                self.warn(where, f"an agent with `access: {access}` reads output from `{source}`, which has `web: true`; "
                                  "web pages can carry instructions aimed at agents")
             if tools := [use.name for use in self.wf.setting(source, "tools") or ()]:
-                self.warn(where, f"an agent with `access: full` reads output from `{source}`, which reads {', '.join(tools)}; "
+                self.warn(where, f"an agent with `access: {access}` reads output from `{source}`, which reads {', '.join(tools)}; "
                                  "messages, notes and mail that other people write can carry instructions aimed at agents")
 
     def _harness(self, node_id: str) -> set[str]:
@@ -715,6 +723,34 @@ class _Checker:
                 label = "cursor through cursor-agent" if name == "cursor" else name
                 self.warn(where, f"on {label}, `project_instructions: false` doesn't keep out {kept}")
 
+    def _commit_message(self, where: str, source: str, node_id: str) -> None:
+        """What `commit_message` can't read, because it renders before the node's pass, and a message that is empty."""
+        try:
+            refs, pattern = templates.references(source), templates.pattern(source)
+        except TemplateError:
+            return  # reported with the node's other templates
+        if all(isinstance(part, str) for part in pattern) and not "".join(pattern).strip():
+            self.error(where, "`commit_message` is empty: write a message, or leave `commit_message` out "
+                              "for a message that names the changed files")
+        if any(ref.name == "session" for ref in refs):
+            self.error(where, "`session` isn't available here: the message renders before the session starts")
+        for ref in refs:
+            if ref.name == node_id or (ref.name == "results" and ref.path and ref.path[0] == node_id):
+                self._warned.add((where, node_id))  # this error says more than the warning that it might not have run
+                self.error(where, f"reads `{_dotted(ref.name, ref.path)}`, but the message renders before this node's "
+                                  f"pass, so it would hold the output of an earlier pass")
+                return
+
+    def _commits(self, node_id: str) -> None:
+        """`commit_message` is on a node that the runner can commit for: an `edit` or `full` agent in a worktree."""
+        where, access = f"nodes.{node_id}.commit_message", self.wf.setting(node_id, "access")
+        if access not in ("edit", "full"):
+            self.error(where, f"`commit_message` is the message of the runner's commit after an `edit` or `full` agent, "
+                              f"but this node's access is `{access}`")
+        elif self._workspace_kind(node_id) == "temp":
+            self.error(where, "`commit_message` is the message of the runner's commit in a git worktree that it made, "
+                              "but this node's workspace is `temp`")
+
     def _tool_list(self, where: str, uses: list) -> None:
         seen = set()
         for i, use in enumerate(uses):
@@ -740,6 +776,10 @@ class _Checker:
 
     def _workspace(self, node_id: str) -> None:
         workspace = self.wf.setting(node_id, "workspace")
+        if self.nodes[node_id].kind == "agent" and self.wf.setting(node_id, "access") == "review" \
+                and self._workspace_kind(node_id) == "temp":
+            self.error(f"nodes.{node_id}", "`access: review` works in a copy of a git worktree, and a `temp` workspace "
+                                           "is an empty folder")
         if workspace in ("repo", "new", "temp"):
             return
         where = f"nodes.{node_id}.workspace"
@@ -893,6 +933,15 @@ class _Checker:
             return bool(steps) and self.nodes[name].for_each is None
         return {"start": 1, "run": 1, "workspace": 2}.get(name, 99) <= len(steps)
 
+    def _workspace_kind(self, node_id: str, seen: tuple = ()) -> str | None:
+        """repo, new or temp: the workspace that a node gets, through `workspace: <node>` too. None when it's unknown."""
+        workspace = self.wf.setting(node_id, "workspace")
+        if workspace in ("repo", "new", "temp"):
+            return workspace
+        if workspace in self.nodes and workspace not in seen and workspace != node_id:
+            return self._workspace_kind(workspace, (*seen, node_id))
+        return None
+
     def _concurrent_edits(self) -> None:
         editors = [n for n, node in self.nodes.items()
                    if node.kind == "agent" and self.wf.setting(n, "access") in ("edit", "full")]
@@ -917,6 +966,16 @@ class _Checker:
                     and self.wf.setting(b, "max_parallel") > 1):  # new and temp give each item its own folder
                 self.warn(f"nodes.{b}", "items run in parallel in the same workspace and each edits it; "
                                         "use `workspace: new` or `max_parallel: 1`")
+        commands = [n for n, node in self.nodes.items() if node.kind == "command"]  # a file that one writes also counts
+        for b, node in self.nodes.items():  # a review fails when its workspace changes while it runs
+            if node.kind != "agent" or self.wf.setting(b, "access") != "review" or (shared := key(b)) is None:
+                continue
+            for a in editors + commands:
+                if key(a) == shared and not self._ordered(a, b):
+                    label = "repo" if shared == "repo" else f"`{shared}`"
+                    verb = "write to" if a in commands else "edit"
+                    self.warn(f"nodes.{b}", f"`{a}` could {verb} the {label} workspace while `{b}` reviews it, and then "
+                                            f"`{b}` fails")
 
     def _ordered(self, a: str, b: str) -> bool:
         """Is there a path from one to the other, so they can't overlap?"""
@@ -1159,7 +1218,8 @@ def _reads_follow_up(workflow: Workflow, node_id: str) -> bool:
     """Does a template or expression of the node read `follow_up`?"""
     node = workflow.nodes[node_id]
     texts = [(text, False) for text in (getattr(node, "instruction", None), getattr(node, "command", None),
-                                        getattr(node, "human", None), node.base, node.branch) if isinstance(text, str)]
+                                        getattr(node, "human", None), node.base, node.branch)
+              if isinstance(text, str)]  # not commit_message: a request that only it reads gets no work done
     texts += [(text, False) for text in workflow.setting(node_id, "env").values()] if node.kind == "command" else []
     texts += [(text, False) for text in node.with_.values() if isinstance(text, str)] if node.kind == "workflow" else []
     for name in ("harness", "model", "effort"):  # a string, a list of harnesses, or a map by harness
